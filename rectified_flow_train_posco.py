@@ -1,22 +1,47 @@
 from __future__ import annotations
 
 import os
+import sys
+
+# This repository has a local copy.py helper. Temporarily hide the script
+# directory while importing stdlib/third-party libraries that need stdlib copy.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REMOVED_SYS_PATH_ENTRIES = []
+for _path_value in ("", _SCRIPT_DIR):
+    while _path_value in sys.path:
+        _idx = sys.path.index(_path_value)
+        _REMOVED_SYS_PATH_ENTRIES.append((_idx, _path_value))
+        sys.path.pop(_idx)
+
 import math
 import time
 import datetime
 import argparse
-import copy
-from typing import List, Tuple, Optional
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 
+from PIL import Image
+import torchvision.transforms as T
 from torchvision.transforms import functional as TF
-from torchvision.utils import save_image
+from torchvision.transforms import InterpolationMode
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
+for _idx, _path_value in sorted(_REMOVED_SYS_PATH_ENTRIES):
+    sys.path.insert(min(_idx, len(sys.path)), _path_value)
+del _REMOVED_SYS_PATH_ENTRIES, _SCRIPT_DIR
 
 from datasets import MVTecDataset, VisADataset, POSCODataset
 from models.extractors import build_extractor
@@ -86,6 +111,326 @@ class DRAEMAnomaly:
         out = (1 - mask3) * x01 + (1 - beta) * mask3 * x01 + beta * mask3 * texture
         out = out.clamp(0, 1)
         return _renorm(out, self.img_mean, self.img_std)
+
+
+# ------------------------- Diffusion result pairs -------------------------
+
+DIFFUSION_REQUIRED_BUNDLE_FILES = {
+    "background.png",
+    "foreground.png",
+    "segmentation.png",
+    "location.png",
+}
+SAMPLE_NUMBER_PATTERN = re.compile(r"(?:^|_)(\d{6,7})(?:\D*$|$)")
+OBJECT_LABEL_PATTERN = re.compile(r"(object_\d+)")
+
+
+@dataclass(frozen=True)
+class DiffusionPair:
+    sample_key: str
+    sample_name: str
+    object_label: str
+    size_bucket: str
+    input_dir: str
+    normal_path: str
+    anomaly_path: str
+
+
+def _normalize_ext(ext: str) -> str:
+    return ext if ext.startswith(".") else f".{ext}"
+
+
+def _sample_sort_key(sample_key: str, sample_name: str):
+    matches = SAMPLE_NUMBER_PATTERN.findall(sample_name)
+    sample_number = int(matches[-1]) if matches else float("inf")
+    return sample_number, sample_key
+
+
+def _object_label_for_sample(sample_name: str) -> str:
+    match = OBJECT_LABEL_PATTERN.search(sample_name)
+    return match.group(1) if match else "unknown"
+
+
+def _size_bucket_for_rel_parent(rel_parent: str) -> str:
+    if not rel_parent:
+        return "all"
+    return Path(rel_parent).parts[0]
+
+
+def _evenly_spaced(items: List[DiffusionPair], limit: Optional[int]) -> List[DiffusionPair]:
+    if limit is None or limit < 0 or len(items) <= limit:
+        return list(items)
+    if limit <= 0:
+        return []
+    if limit == 1:
+        return [items[0]]
+
+    max_idx = len(items) - 1
+    selected: List[DiffusionPair] = []
+    seen = set()
+    for i in range(limit):
+        idx = int(round(i * max_idx / (limit - 1)))
+        while idx in seen and idx < max_idx:
+            idx += 1
+        while idx in seen and idx > 0:
+            idx -= 1
+        if idx not in seen:
+            selected.append(items[idx])
+            seen.add(idx)
+    return selected
+
+
+def _discover_diffusion_inputs(input_root: Path) -> List[Tuple[str, str, str, Path]]:
+    samples: List[Tuple[str, str, str, Path]] = []
+    for root, dirs, files in os.walk(input_root):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        if DIFFUSION_REQUIRED_BUNDLE_FILES.issubset(set(files)):
+            sample_dir = Path(root)
+            rel_dir = os.path.relpath(sample_dir, input_root)
+            sample_name = sample_dir.name
+            rel_parent = os.path.dirname(rel_dir)
+            if rel_parent == ".":
+                rel_parent = ""
+            sample_key = os.path.join(rel_parent, sample_name) if rel_parent else sample_name
+            samples.append((sample_key, sample_name, rel_parent, sample_dir))
+            dirs[:] = []
+    return sorted(samples, key=lambda item: _sample_sort_key(item[0], item[1]))
+
+
+def _build_diffusion_result_index(result_root: Path, flat_output: bool, output_ext: str) -> Tuple[Dict[str, Path], Dict[str, List[Path]], int]:
+    by_key: Dict[str, Path] = {}
+    by_name: Dict[str, List[Path]] = {}
+    if not result_root.is_dir():
+        return by_key, by_name, 0
+
+    ext = _normalize_ext(output_ext).lower()
+    result_count = 0
+    for root, dirs, files in os.walk(result_root):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        root_path = Path(root)
+        if flat_output:
+            for name in files:
+                if name.startswith("."):
+                    continue
+                path = root_path / name
+                if path.suffix.lower() != ext:
+                    continue
+                rel_parent = os.path.relpath(root_path, result_root)
+                if rel_parent == ".":
+                    rel_parent = ""
+                sample_name = path.stem
+                sample_key = os.path.join(rel_parent, sample_name) if rel_parent else sample_name
+                by_key.setdefault(sample_key, path)
+                by_name.setdefault(sample_name, []).append(path)
+                result_count += 1
+        elif "results_highres.png" in files:
+            path = root_path / "results_highres.png"
+            rel_parent = os.path.relpath(root_path.parent, result_root)
+            if rel_parent == ".":
+                rel_parent = ""
+            sample_name = root_path.name
+            sample_key = os.path.join(rel_parent, sample_name) if rel_parent else sample_name
+            by_key.setdefault(sample_key, path)
+            by_name.setdefault(sample_name, []).append(path)
+            result_count += 1
+    return by_key, by_name, result_count
+
+
+def _result_path_for_sample(result_by_key: Dict[str, Path], result_by_name: Dict[str, List[Path]], sample_key: str, sample_name: str) -> Optional[Path]:
+    if sample_key in result_by_key:
+        return result_by_key[sample_key]
+    candidates = result_by_name.get(sample_name, [])
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _load_diffusion_metadata(input_root: Path) -> Dict[str, dict]:
+    metadata_path = input_root / "metadata.jsonl"
+    records: Dict[str, dict] = {}
+    if not metadata_path.exists():
+        return records
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"[Warning] invalid json at {metadata_path}:{line_no}: {exc}")
+                continue
+            sample = record.get("sample_id") or record.get("sample")
+            if sample:
+                records.setdefault(sample, record)
+    return records
+
+
+def _metadata_size_bucket(record: Optional[dict], fallback: str) -> str:
+    if not record:
+        return fallback
+    value = record.get("placement_size_dir") or record.get("placement_size_label")
+    return str(value) if value else fallback
+
+
+def _metadata_object_label(record: Optional[dict], sample_name: str) -> str:
+    if record and record.get("object_label"):
+        return str(record["object_label"])
+    return _object_label_for_sample(sample_name)
+
+
+def _limit_diffusion_pairs_per_object(pairs: List[DiffusionPair], max_per_object: Optional[int]) -> List[DiffusionPair]:
+    if max_per_object is None or max_per_object < 0:
+        return list(pairs)
+
+    groups: Dict[str, Dict[str, List[DiffusionPair]]] = {}
+    for pair in pairs:
+        groups.setdefault(pair.object_label, {}).setdefault(pair.size_bucket, []).append(pair)
+
+    selected_ids = set()
+    for buckets in groups.values():
+        for bucket_pairs in buckets.values():
+            bucket_pairs.sort(key=lambda pair: _sample_sort_key(pair.sample_key, pair.sample_name))
+
+        active_buckets = [name for name, items in sorted(buckets.items()) if items]
+        if not active_buckets:
+            continue
+        if active_buckets == ["all"]:
+            selected = _evenly_spaced(buckets["all"], max_per_object)
+        else:
+            quota = {
+                name: min(len(buckets[name]), max_per_object // len(active_buckets))
+                for name in active_buckets
+            }
+            remainder = max_per_object - sum(quota.values())
+            while remainder > 0:
+                added = False
+                for name in active_buckets:
+                    if quota[name] < len(buckets[name]):
+                        quota[name] += 1
+                        remainder -= 1
+                        added = True
+                        if remainder == 0:
+                            break
+                if not added:
+                    break
+            selected = []
+            for name in active_buckets:
+                selected.extend(_evenly_spaced(buckets[name], quota[name]))
+
+        for pair in selected:
+            selected_ids.add((pair.sample_key, pair.normal_path, pair.anomaly_path))
+
+    return [pair for pair in pairs if (pair.sample_key, pair.normal_path, pair.anomaly_path) in selected_ids]
+
+
+def _build_diffusion_pairs(input_root: Path, result_root: Path, flat_output: bool, output_ext: str, max_per_object: Optional[int]) -> Tuple[List[DiffusionPair], Dict[str, int]]:
+    if not input_root.is_dir():
+        raise FileNotFoundError(f"Diffusion input root not found: {input_root}")
+    if not result_root.is_dir():
+        raise FileNotFoundError(f"Diffusion result root not found: {result_root}")
+
+    input_samples = _discover_diffusion_inputs(input_root)
+    result_by_key, result_by_name, result_count = _build_diffusion_result_index(
+        result_root,
+        flat_output=flat_output,
+        output_ext=output_ext,
+    )
+    metadata = _load_diffusion_metadata(input_root)
+
+    pairs: List[DiffusionPair] = []
+    pending_results = 0
+    for sample_key, sample_name, rel_parent, input_dir in input_samples:
+        record = metadata.get(sample_name)
+        result_path = _result_path_for_sample(result_by_key, result_by_name, sample_key, sample_name)
+        if result_path is None and record and record.get("anomaly_path"):
+            candidate = Path(record["anomaly_path"]).expanduser().resolve(strict=False)
+            if candidate.exists():
+                result_path = candidate
+        if result_path is None or not result_path.exists():
+            pending_results += 1
+            continue
+        normal_path = input_dir / "background.png"
+        size_bucket = _metadata_size_bucket(record, _size_bucket_for_rel_parent(rel_parent))
+        pairs.append(
+            DiffusionPair(
+                sample_key=sample_key,
+                sample_name=sample_name,
+                object_label=_metadata_object_label(record, sample_name),
+                size_bucket=size_bucket,
+                input_dir=str(input_dir),
+                normal_path=str(normal_path),
+                anomaly_path=str(result_path),
+            )
+        )
+
+    selected_pairs = _limit_diffusion_pairs_per_object(pairs, max_per_object)
+    stats = {
+        "input_bundles": len(input_samples),
+        "result_images": result_count,
+        "completed_pairs": len(pairs),
+        "pending_results": pending_results,
+        "selected_pairs": len(selected_pairs),
+    }
+    return selected_pairs, stats
+
+
+class DiffusionPairDataset(TorchDataset):
+    """Normal/background and generated anomaly pairs from TALE POSCO outputs."""
+
+    def __init__(self, input_root: str, result_root: str, input_size: Tuple[int, int], img_mean: List[float], img_std: List[float], *,
+                 flat_output: bool = True, output_ext: str = ".jpg", max_per_object: Optional[int] = 290, reverse: bool = False):
+        self.input_root = Path(input_root).expanduser().resolve(strict=False)
+        self.result_root = Path(result_root).expanduser().resolve(strict=False)
+        self.pairs, self.stats = _build_diffusion_pairs(
+            self.input_root,
+            self.result_root,
+            flat_output=flat_output,
+            output_ext=output_ext,
+            max_per_object=max_per_object,
+        )
+        if reverse:
+            self.pairs = list(reversed(self.pairs))
+        if not self.pairs:
+            raise ValueError(f"No completed diffusion pairs found: input_root={self.input_root}, result_root={self.result_root}")
+
+        self.transform = T.Compose([
+            T.Resize(input_size, InterpolationMode.LANCZOS),
+            T.ToTensor(),
+            T.Normalize(img_mean, img_std),
+        ])
+        self._print_summary(max_per_object)
+
+    def _print_summary(self, max_per_object: Optional[int]) -> None:
+        print(f"Diffusion pair train dataset: input_root={self.input_root}")
+        print(f"Diffusion pair train dataset: result_root={self.result_root}")
+        print(
+            "Diffusion pairs: "
+            f"input_bundles={self.stats['input_bundles']} "
+            f"result_images={self.stats['result_images']} "
+            f"completed_pairs={self.stats['completed_pairs']} "
+            f"pending_results={self.stats['pending_results']} "
+            f"selected_pairs={self.stats['selected_pairs']} "
+            f"max_per_object={max_per_object}"
+        )
+        counts: Dict[str, Dict[str, int]] = {}
+        for pair in self.pairs:
+            counts.setdefault(pair.object_label, {}).setdefault(pair.size_bucket, 0)
+            counts[pair.object_label][pair.size_bucket] += 1
+        for object_label in sorted(counts):
+            bucket_counts = counts[object_label]
+            total = sum(bucket_counts.values())
+            detail = ", ".join(f"{name}:{bucket_counts[name]}" for name in sorted(bucket_counts))
+            print(f"  {object_label}: total={total} ({detail})")
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        pair = self.pairs[idx]
+        normal = Image.open(pair.normal_path).convert("RGB")
+        anomaly = Image.open(pair.anomaly_path).convert("RGB")
+        return self.transform(normal), self.transform(anomaly), pair.sample_key
 
 
 class TimeEmbedding(nn.Module):
@@ -329,7 +674,29 @@ def build_args():
     parser.add_argument('--rf-tdims', default=[128,128], type=int, nargs='+')
     parser.add_argument('--rf-depths', default=[3,3], type=int, nargs='+')
     parser.add_argument('--rf-steps', default=1, type=int)
-    parser.add_argument('--rf-ckpt', default='', type=str)
+    parser.add_argument('--rf-ckpt', default='', type=str,
+                        help='RF checkpoint path for warm-start or resume. With --resume-rf, defaults to <ckpt_dir>/rf_last.pt if empty.')
+    parser.add_argument('--resume-rf', action='store_true', default=False,
+                        help='Resume RF training from --rf-ckpt, restoring model, optimizer, and epoch.')
+    parser.add_argument('--save-every', default=5, type=int,
+                        help='Save rf_epoch_XXXX.pt every N completed epochs. Use 0 to disable periodic saves.')
+    parser.add_argument('--no-progress', action='store_true', default=False,
+                        help='Disable tqdm progress bars during RF training.')
+
+    parser.add_argument('--train-source', default='dataset', choices=['dataset', 'diffusion'],
+                        help='dataset: create DRAEM pseudo anomalies online. diffusion: use TALE background/result image pairs.')
+    parser.add_argument('--diffusion-input-root', default='', type=str,
+                        help='Root with input bundles, e.g. diffusion_result/input.')
+    parser.add_argument('--diffusion-result-root', default='', type=str,
+                        help='Root with generated results, e.g. diffusion_result/result.')
+    parser.add_argument('--diffusion-output-ext', default='.jpg', type=str,
+                        help='Generated result extension when --diffusion-flat-output is enabled.')
+    parser.add_argument('--diffusion-flat-output', action=argparse.BooleanOptionalAction, default=True,
+                        help='Match result/<size>/<sample>.jpg. Use --no-diffusion-flat-output for <sample>/results_highres.png.')
+    parser.add_argument('--diffusion-max-per-object', default=-1, type=int,
+                        help='Cap completed diffusion pairs per object, balanced across size folders. Default -1 uses all completed result pairs.')
+    parser.add_argument('--diffusion-reverse', action='store_true', default=False,
+                        help='Reverse selected diffusion pair order after balancing.')
 
     parser.add_argument('--data-path', default='', type=str)
     parser.add_argument('--work-dir', default='./work_dirs', type=str)
@@ -477,52 +844,137 @@ def discover_msflow_class_names(args) -> List[str]:
     return valid_class_names
 
 
+def build_train_loader(c, args):
+    if args.train_source == 'diffusion':
+        if not args.diffusion_input_root:
+            raise ValueError('--diffusion-input-root is required when --train-source diffusion')
+        if not args.diffusion_result_root:
+            raise ValueError('--diffusion-result-root is required when --train-source diffusion')
+        train_dataset = DiffusionPairDataset(
+            args.diffusion_input_root,
+            args.diffusion_result_root,
+            c.input_size,
+            c.img_mean,
+            c.img_std,
+            flat_output=args.diffusion_flat_output,
+            output_ext=args.diffusion_output_ext,
+            max_per_object=args.diffusion_max_per_object,
+            reverse=args.diffusion_reverse,
+        )
+    else:
+        Dataset = select_dataset_class(c.dataset)
+        train_dataset = Dataset(c, is_train=True)
+
+    return DataLoader(
+        train_dataset,
+        batch_size=c.batch_size,
+        shuffle=True,
+        num_workers=c.workers,
+        pin_memory=True,
+    )
+
+
+
+def save_rf_checkpoint(c, rf_model, optimizer, epoch: int, filename: str) -> str:
+    ckpt_path = os.path.join(c.ckpt_dir, filename)
+    torch.save(
+        {
+            'rf_model': rf_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch,
+        },
+        ckpt_path,
+    )
+    return ckpt_path
+
+
+def resolve_rf_resume_ckpt(c, args) -> str:
+    if args.rf_ckpt:
+        return args.rf_ckpt
+    return os.path.join(c.ckpt_dir, 'rf_last.pt')
+
 def train_rf(args):
     import default as c
     c = resolve_defaults(c, args)
     init_seeds(args.seed)
 
-    Dataset = select_dataset_class(c.dataset)
-    train_dataset = Dataset(c, is_train=True)
-    train_loader = DataLoader(train_dataset, batch_size=c.batch_size, shuffle=True, num_workers=c.workers, pin_memory=True)
+    train_loader = build_train_loader(c, args)
 
     msflow_ckpt = resolve_msflow_ckpt(args)
     assert os.path.isfile(msflow_ckpt), f'MSFlow checkpoint not found: {msflow_ckpt}'
     print(f'[MSFlow] load: {msflow_ckpt}')
     extractor, parallel_flows, fusion_flow = load_msflow_frozen(c, msflow_ckpt)
 
-    test_dataset = Dataset(c, is_train=False)
-    test_loader = DataLoader(test_dataset, batch_size=c.batch_size, shuffle=False, num_workers=c.workers, pin_memory=True)
-
-    det_auroc_obs = Score_Observer('Det.AUROC', args.rf_epochs)
-    loc_auroc_obs = Score_Observer('Loc.AUROC', args.rf_epochs)
-    loc_pro_obs = Score_Observer('Loc.PRO', args.rf_epochs)
-
     rf_model = None
     optimizer = None
-    anomaly_gen = DRAEMAnomaly(c.img_mean, c.img_std, beta_range=(0.1, 1.0))
-    
-    for epoch in range(args.rf_epochs):
+    anomaly_gen = None
+    if args.train_source == 'dataset':
+        anomaly_gen = DRAEMAnomaly(c.img_mean, c.img_std, beta_range=(0.1, 1.0))
+
+    start_epoch = 0
+    pending_ckpt = None
+    pending_ckpt_path = ''
+    if args.resume_rf:
+        pending_ckpt_path = resolve_rf_resume_ckpt(c, args)
+        assert os.path.isfile(pending_ckpt_path), f'RF resume checkpoint not found: {pending_ckpt_path}'
+        pending_ckpt = torch.load(pending_ckpt_path, map_location='cpu')
+        if not isinstance(pending_ckpt, dict) or 'rf_model' not in pending_ckpt:
+            raise ValueError(f'RF resume checkpoint is missing rf_model: {pending_ckpt_path}')
+        if 'optimizer' not in pending_ckpt:
+            raise ValueError(f'RF resume checkpoint is missing optimizer: {pending_ckpt_path}')
+        start_epoch = int(pending_ckpt.get('epoch', -1)) + 1
+        print(f'[RF] resume requested: ckpt={pending_ckpt_path} start_epoch={start_epoch}')
+    elif args.rf_ckpt:
+        pending_ckpt_path = args.rf_ckpt
+        assert os.path.isfile(pending_ckpt_path), f'RF checkpoint not found: {pending_ckpt_path}'
+        pending_ckpt = torch.load(pending_ckpt_path, map_location='cpu')
+        print(f'[RF] warm-start requested: ckpt={pending_ckpt_path}')
+
+    if start_epoch >= args.rf_epochs:
+        print(f'[RF] no training needed: start_epoch={start_epoch} >= rf_epochs={args.rf_epochs}')
+        return
+
+    use_progress = tqdm is not None and not args.no_progress
+    if tqdm is None and not args.no_progress:
+        print('[Warning] tqdm is not installed; progress bar is disabled.')
+
+    for epoch in range(start_epoch, args.rf_epochs):
         if rf_model is not None:
             rf_model.train()
-        for img, y, _ in train_loader:
-            if y.sum().item() != 0:
-                img = img[y == 0]
-                if img.numel() == 0:
-                    continue
-            img = img.to(c.device, non_blocking=True)
+        epoch_loss = 0.0
+        n = 0
+        epoch_iter = train_loader
+        if use_progress:
+            epoch_iter = tqdm(
+                train_loader,
+                total=len(train_loader),
+                desc=f'RF epoch {epoch + 1}/{args.rf_epochs}',
+                dynamic_ncols=True,
+                leave=True,
+            )
+        for batch in epoch_iter:
+            if args.train_source == 'diffusion':
+                img, img_pseudo, _ = batch
+                img = img.to(c.device, non_blocking=True)
+                img_pseudo = img_pseudo.to(c.device, non_blocking=True)
+            else:
+                img, y, _ = batch
+                if y.sum().item() != 0:
+                    img = img[y == 0]
+                    if img.numel() == 0:
+                        continue
+                img = img.to(c.device, non_blocking=True)
 
-            p_identity = 0.10
-            img_pseudo_list = []
-            for x in img:
-                if torch.rand(1).item() < p_identity:
-                    x_pseudo = x
-                else:
-                    x_pseudo = anomaly_gen(x)
-            
-                img_pseudo_list.append(x_pseudo)
-            
-            img_pseudo = torch.stack(img_pseudo_list, dim=0)
+                assert anomaly_gen is not None
+                p_identity = 0.10
+                img_pseudo_list = []
+                for x in img:
+                    if torch.rand(1).item() < p_identity:
+                        x_pseudo = x
+                    else:
+                        x_pseudo = anomaly_gen(x)
+                    img_pseudo_list.append(x_pseudo)
+                img_pseudo = torch.stack(img_pseudo_list, dim=0)
 
             with torch.no_grad():
                 _, z_fused_list, _ = msflow_forward(c, extractor, parallel_flows, fusion_flow, img, return_pre_fusion=True)
@@ -538,11 +990,15 @@ def train_rf(args):
                 else:
                     rf_model = MultiScaleRF(channels_list, tdim=args.rf_tdim, depth=args.rf_depth).to(c.device)
                 optimizer = torch.optim.Adam(rf_model.parameters(), lr=args.rf_lr)
-                if args.rf_ckpt and os.path.isfile(args.rf_ckpt):
-                    ckpt = torch.load(args.rf_ckpt, map_location='cpu')
-                    rf_model.load_state_dict(ckpt['rf_model'])
-                    optimizer.load_state_dict(ckpt['optimizer'])
-                    print(f'[RF] resumed from {args.rf_ckpt}')
+
+                if pending_ckpt is not None:
+                    state = pending_ckpt['rf_model'] if isinstance(pending_ckpt, dict) and 'rf_model' in pending_ckpt else pending_ckpt
+                    rf_model.load_state_dict(state)
+                    if args.resume_rf:
+                        optimizer.load_state_dict(pending_ckpt['optimizer'])
+                        print(f'[RF] resumed model+optimizer from {pending_ckpt_path}')
+                    else:
+                        print(f'[RF] warm-started model from {pending_ckpt_path}')
 
             optimizer.zero_grad(set_to_none=True)
             loss = rf_loss(rf_model, z_p_list, z_list)
@@ -550,9 +1006,21 @@ def train_rf(args):
             torch.nn.utils.clip_grad_norm_(rf_model.parameters(), 1.0)
             optimizer.step()
 
+            epoch_loss += float(loss.item()) * img.shape[0]
+            n += img.shape[0]
+            if use_progress:
+                epoch_iter.set_postfix(loss=f'{epoch_loss / max(n, 1):.4e}', samples=n)
+
+        avg_loss = epoch_loss / max(n, 1)
+        completed_epoch = epoch + 1
+        print(datetime.datetime.now().strftime('[%Y-%m-%d-%H:%M:%S]'), f'Epoch {epoch} RF train loss: {avg_loss:.6e} samples={n}')
+
         if rf_model is not None:
-            ckpt_last = os.path.join(c.ckpt_dir, 'rf_last.pt')
-            torch.save({'rf_model': rf_model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch}, ckpt_last)
+            ckpt_last = save_rf_checkpoint(c, rf_model, optimizer, epoch, 'rf_last.pt')
+            print(f'[RF] saved: {ckpt_last}')
+            if args.save_every > 0 and completed_epoch % args.save_every == 0:
+                ckpt_periodic = save_rf_checkpoint(c, rf_model, optimizer, epoch, f'rf_epoch_{completed_epoch:04d}.pt')
+                print(f'[RF] saved periodic checkpoint: {ckpt_periodic}')
 
     if rf_model is not None:
         print(f'[RF] saved last checkpoint: {os.path.join(c.ckpt_dir, "rf_last.pt")}')
@@ -564,8 +1032,17 @@ def main():
     parser = build_args()
     args = parser.parse_args()
 
-    args.class_name = "posco"
-    args.posco_train_subdir = None
+    if args.train_by_msflow_folder:
+        class_names = discover_msflow_class_names(args)
+        print(f'[INFO] train-by-msflow-folder enabled. Found {len(class_names)} folder(s): {class_names}')
+        for class_name in class_names:
+            run_args = argparse.Namespace(**vars(args))
+            run_args.class_name = class_name
+            if not getattr(args, 'posco_train_subdir', '') and args.train_source == 'dataset':
+                run_args.posco_train_subdir = class_name
+            run_args.msflow_ckpt = ''
+            train_rf(run_args)
+        return
 
     train_rf(args)
 
