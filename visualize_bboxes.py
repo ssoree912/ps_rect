@@ -292,17 +292,21 @@ def draw_bboxes_on_image(img: Image.Image, bboxes, color='red', width=3):
     return out
 
 
-def image_name_to_gt_txt(fname: str) -> str:
-    """
-    Convert a frame image name to its matching GT txt name.
-
-    Example:
-      [CH010] 20251108141001-20251108141500_000000.jpg
-    -> [CH010] 20251108141001-20251108141500.txt
-    """
+def image_name_to_gt_txt_candidates(fname: str) -> List[str]:
+    """Return GT txt filename candidates for exact-frame and sequence-level GT files."""
     stem, _ = os.path.splitext(os.path.basename(fname))
-    stem = re.sub(r'_\d{6}$', '', stem)
-    return stem + '.txt'
+    stripped = re.sub(r'_\d+$', '', stem)
+
+    candidates = []
+    for candidate in (stem + '.txt', stripped + '.txt'):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def image_name_to_gt_txt(fname: str) -> str:
+    """Backward-compatible sequence-level GT name for a frame image."""
+    return image_name_to_gt_txt_candidates(fname)[-1]
 
 
 @lru_cache(maxsize=16)
@@ -337,16 +341,17 @@ def choose_indexed_gt(paths, folder_name: Optional[str], label_name: Optional[st
 
 def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None) -> Optional[str]:
     """Find matching GT txt for an original image filename."""
-    gt_name = image_name_to_gt_txt(fname)
+    gt_names = image_name_to_gt_txt_candidates(fname)
 
     candidates = []
-    if label_name is not None and folder_name is not None:
-        candidates.append(os.path.join(gt_dir, str(label_name), str(folder_name), gt_name))
-    if folder_name is not None:
-        candidates.append(os.path.join(gt_dir, str(folder_name), gt_name))
-    if label_name is not None:
-        candidates.append(os.path.join(gt_dir, str(label_name), gt_name))
-    candidates.append(os.path.join(gt_dir, gt_name))
+    for gt_name in gt_names:
+        if label_name is not None and folder_name is not None:
+            candidates.append(os.path.join(gt_dir, str(label_name), str(folder_name), gt_name))
+        if folder_name is not None:
+            candidates.append(os.path.join(gt_dir, str(folder_name), gt_name))
+        if label_name is not None:
+            candidates.append(os.path.join(gt_dir, str(label_name), gt_name))
+        candidates.append(os.path.join(gt_dir, gt_name))
 
     for path in candidates:
         if os.path.isfile(path):
@@ -355,7 +360,11 @@ def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name
     # Fallback for GT directories that have an extra nesting level. Only use it
     # when the basename resolves unambiguously after folder/label preference.
     index = build_gt_name_index(os.path.abspath(gt_dir))
-    return choose_indexed_gt(index.get(gt_name.lower(), []), folder_name, label_name)
+    for gt_name in gt_names:
+        indexed = choose_indexed_gt(index.get(gt_name.lower(), []), folder_name, label_name)
+        if indexed is not None:
+            return indexed
+    return None
 
 def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None):
     """
@@ -479,11 +488,17 @@ def save_detection_eval_txt(out_dir: str, fname: str, gt_path: Optional[str], pr
             f.write(f'{pi} {gi} {iou:.6f}\n')
 
 
-def save_f1_summary(out_path: str, total_tp: int, total_fp: int, total_fn: int, evaluated_images: int, missing_gt_images: int):
+def save_f1_summary(out_path: str, total_tp: int, total_fp: int, total_fn: int,
+                    evaluated_images: int, missing_gt_images: int, matched_gt_images: int = 0,
+                    empty_gt_files: int = 0, total_pred_boxes: int = 0, total_gt_boxes: int = 0):
     precision, recall, f1 = compute_prf(total_tp, total_fp, total_fn)
     with open(out_path, 'w') as f:
         f.write(f'evaluated_images: {evaluated_images}\n')
+        f.write(f'matched_gt_images: {matched_gt_images}\n')
         f.write(f'missing_gt_images_skipped: {missing_gt_images}\n')
+        f.write(f'empty_gt_files: {empty_gt_files}\n')
+        f.write(f'total_pred_boxes: {total_pred_boxes}\n')
+        f.write(f'total_gt_boxes: {total_gt_boxes}\n')
         f.write(f'TP: {total_tp}\n')
         f.write(f'FP: {total_fp}\n')
         f.write(f'FN: {total_fn}\n')
@@ -771,6 +786,10 @@ def run_one_folder(args, folder_name: str):
     total_fn = 0
     evaluated_images = 0
     missing_gt_images = 0
+    matched_gt_images = 0
+    empty_gt_files = 0
+    total_pred_boxes = 0
+    total_gt_boxes = 0
 
     for imgs, img_paths, label_names, folder_names, fnames in loader:
         imgs = imgs.to(cfg.device, non_blocking=True)
@@ -815,6 +834,7 @@ def run_one_folder(args, folder_name: str):
             )
 
             if args.eval_f1:
+                total_pred_boxes += len(pred_boxes)
                 gt_boxes, gt_path = load_gt_boxes(args.gt_dir, folder_name, fname, label_names[b])
                 if gt_path is None:
                     missing_gt_images += 1
@@ -828,6 +848,10 @@ def run_one_folder(args, folder_name: str):
                         evaluated_images += 1
                         save_detection_eval_txt(out_dir, fname, gt_path, pred_boxes, [], tp, fp, fn, matches)
                 else:
+                    matched_gt_images += 1
+                    total_gt_boxes += len(gt_boxes)
+                    if len(gt_boxes) == 0:
+                        empty_gt_files += 1
                     tp, fp, fn, matches = match_boxes_for_f1(
                         pred_boxes, gt_boxes, iou_threshold=args.iou_threshold
                     )
@@ -842,11 +866,13 @@ def run_one_folder(args, folder_name: str):
         summary_path = os.path.join(args.output_dir, folder_name, 'f1_summary.txt')
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
         precision, recall, f1 = save_f1_summary(
-            summary_path, total_tp, total_fp, total_fn, evaluated_images, missing_gt_images
+            summary_path, total_tp, total_fp, total_fn, evaluated_images, missing_gt_images,
+            matched_gt_images, empty_gt_files, total_pred_boxes, total_gt_boxes
         )
         print(f'[F1] folder={folder_name} TP={total_tp} FP={total_fp} FN={total_fn} '
               f'precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} '
-              f'evaluated_images={evaluated_images} missing_gt={missing_gt_images}')
+              f'evaluated_images={evaluated_images} matched_gt={matched_gt_images} '
+              f'missing_gt={missing_gt_images} pred_boxes={total_pred_boxes} gt_boxes={total_gt_boxes}')
 
     del extractor, parallel_flows, fusion_flow, rf_model
     if torch.cuda.is_available():
@@ -887,6 +913,10 @@ def run_single_model(args):
     total_fn = 0
     evaluated_images = 0
     missing_gt_images = 0
+    matched_gt_images = 0
+    empty_gt_files = 0
+    total_pred_boxes = 0
+    total_gt_boxes = 0
 
     for imgs, img_paths, label_names, folder_names, fnames in loader:
         imgs = imgs.to(cfg.device, non_blocking=True)
@@ -929,6 +959,7 @@ def run_single_model(args):
             )
 
             if args.eval_f1:
+                total_pred_boxes += len(pred_boxes)
                 eval_folder_name = folder_names[b]
                 gt_fname = os.path.basename(img_paths[b])
                 gt_boxes, gt_path = load_gt_boxes(args.gt_dir, eval_folder_name, gt_fname, label_names[b])
@@ -953,6 +984,10 @@ def run_single_model(args):
                         pass
 
                 else:
+                    matched_gt_images += 1
+                    total_gt_boxes += len(gt_boxes)
+                    if len(gt_boxes) == 0:
+                        empty_gt_files += 1
                     tp, fp, fn, matches = match_boxes_for_f1(
                         pred_boxes, gt_boxes, iou_threshold=args.iou_threshold
                     )
@@ -968,11 +1003,13 @@ def run_single_model(args):
         summary_path = os.path.join(args.output_dir, 'f1_summary.txt')
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
         precision, recall, f1 = save_f1_summary(
-            summary_path, total_tp, total_fp, total_fn, evaluated_images, missing_gt_images
+            summary_path, total_tp, total_fp, total_fn, evaluated_images, missing_gt_images,
+            matched_gt_images, empty_gt_files, total_pred_boxes, total_gt_boxes
         )
         print(f'[F1] TP={total_tp} FP={total_fp} FN={total_fn} '
               f'precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} '
-              f'evaluated_images={evaluated_images} missing_gt={missing_gt_images}')
+              f'evaluated_images={evaluated_images} matched_gt={matched_gt_images} '
+              f'missing_gt={missing_gt_images} pred_boxes={total_pred_boxes} gt_boxes={total_gt_boxes}')
 
 
 def main():
