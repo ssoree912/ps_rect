@@ -345,10 +345,8 @@ def choose_indexed_gt(paths, folder_name: Optional[str], label_name: Optional[st
     return preferred[0] if len(preferred) == 1 else None
 
 
-def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None) -> Optional[str]:
-    """Find matching GT txt for an original image filename."""
+def gt_path_candidates(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None):
     gt_names = image_name_to_gt_txt_candidates(fname)
-
     candidates = []
     for gt_name in gt_names:
         if label_name is not None and folder_name is not None:
@@ -358,6 +356,15 @@ def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name
         if label_name is not None:
             candidates.append(os.path.join(gt_dir, str(label_name), gt_name))
         candidates.append(os.path.join(gt_dir, gt_name))
+    return gt_names, candidates
+
+
+def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None) -> Optional[str]:
+    """Find matching GT txt for an original image filename or use an exact GT file path."""
+    if os.path.isfile(gt_dir):
+        return gt_dir
+
+    gt_names, candidates = gt_path_candidates(gt_dir, folder_name, fname, label_name)
 
     for path in candidates:
         if os.path.isfile(path):
@@ -371,6 +378,29 @@ def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name
         if indexed is not None:
             return indexed
     return None
+
+
+def describe_gt_lookup(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None) -> str:
+    if os.path.isfile(gt_dir):
+        return f'image={fname}	label={label_name}	folder={folder_name}	exact_gt_file={gt_dir}'
+    gt_names, candidates = gt_path_candidates(gt_dir, folder_name, fname, label_name)
+    tried = ' | '.join(candidates[:12])
+    if len(candidates) > 12:
+        tried += ' | ...'
+    return (
+        f'image={fname}	label={label_name}	folder={folder_name}	'
+        f'gt_names={",".join(gt_names)}	tried={tried}'
+    )
+
+
+def write_missing_gt_log(path: str, records):
+    if not records:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        for record in records:
+            f.write(record + '\n')
+
 
 def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None):
     """
@@ -792,6 +822,7 @@ def run_one_folder(args, folder_name: str):
     total_fn = 0
     evaluated_images = 0
     missing_gt_images = 0
+    missing_gt_records = []
     matched_gt_images = 0
     empty_gt_files = 0
     total_pred_boxes = 0
@@ -841,9 +872,11 @@ def run_one_folder(args, folder_name: str):
 
             if args.eval_f1:
                 total_pred_boxes += len(pred_boxes)
-                gt_boxes, gt_path = load_gt_boxes(args.gt_dir, folder_name, fname, label_names[b])
+                gt_source = args.gt_path if args.gt_path is not None else args.gt_dir
+                gt_boxes, gt_path = load_gt_boxes(gt_source, folder_name, fname, label_names[b])
                 if gt_path is None:
                     missing_gt_images += 1
+                    missing_gt_records.append(describe_gt_lookup(gt_source, folder_name, fname, label_names[b]))
                     if args.count_missing_gt_as_empty:
                         tp, fp, fn, matches = match_boxes_for_f1(
                             pred_boxes, [], iou_threshold=args.iou_threshold
@@ -871,6 +904,7 @@ def run_one_folder(args, folder_name: str):
     if args.eval_f1:
         summary_path = os.path.join(args.output_dir, folder_name, 'f1_summary.txt')
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+        write_missing_gt_log(os.path.join(args.output_dir, folder_name, 'missing_gt.txt'), missing_gt_records)
         precision, recall, f1 = save_f1_summary(
             summary_path, total_tp, total_fp, total_fn, evaluated_images, missing_gt_images,
             matched_gt_images, empty_gt_files, total_pred_boxes, total_gt_boxes
@@ -919,6 +953,7 @@ def run_single_model(args):
     total_fn = 0
     evaluated_images = 0
     missing_gt_images = 0
+    missing_gt_records = []
     matched_gt_images = 0
     empty_gt_files = 0
     total_pred_boxes = 0
@@ -968,9 +1003,11 @@ def run_single_model(args):
                 total_pred_boxes += len(pred_boxes)
                 eval_folder_name = folder_names[b]
                 gt_fname = os.path.basename(img_paths[b])
-                gt_boxes, gt_path = load_gt_boxes(args.gt_dir, eval_folder_name, gt_fname, label_names[b])
+                gt_source = args.gt_path if args.gt_path is not None else args.gt_dir
+                gt_boxes, gt_path = load_gt_boxes(gt_source, eval_folder_name, gt_fname, label_names[b])
                 if gt_path is None:
                     missing_gt_images += 1
+                    missing_gt_records.append(describe_gt_lookup(gt_source, eval_folder_name, gt_fname, label_names[b]))
 
                     # Only normal images without GT are treated as empty/no-object images.
                     # Abnormal images without GT are skipped because GT annotation is incomplete.
@@ -1008,6 +1045,7 @@ def run_single_model(args):
     if args.eval_f1:
         summary_path = os.path.join(args.output_dir, 'f1_summary.txt')
         os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+        write_missing_gt_log(os.path.join(args.output_dir, 'missing_gt.txt'), missing_gt_records)
         precision, recall, f1 = save_f1_summary(
             summary_path, total_tp, total_fp, total_fn, evaluated_images, missing_gt_images,
             matched_gt_images, empty_gt_files, total_pred_boxes, total_gt_boxes
@@ -1040,6 +1078,8 @@ def main():
                         help='Fill small black holes inside white ROI. Use 0 to disable.')
     parser.add_argument('--gt-dir', '--gt_dir', dest='gt_dir', type=str, default='./gt',
                         help='Directory containing GT txt files. Supports either gt/<name>.txt or gt/<folder>/<name>.txt.')
+    parser.add_argument('--gt-path', '--gt_path', dest='gt_path', type=str, default=None,
+                        help='Exact GT txt file path. If set, this file is used directly instead of matching from --gt-dir.')
     parser.add_argument('--eval-f1', action='store_true', default=False,
                         help='Compute micro precision/recall/F1 using GT txt files and predicted boxes.')
     parser.add_argument('--iou-threshold', type=float, default=0.2,
@@ -1084,7 +1124,7 @@ def main():
     args.explicit_msflow_ckpt = option_was_provided(raw_argv, '--msflow_ckpt', '--msflow-ckpt')
     args.explicit_rf_ckpt = option_was_provided(raw_argv, '--rf_ckpt', '--rf-ckpt')
     for path_attr in (
-        'data_root', 'output_dir', 'mask_dir', 'gt_dir',
+        'data_root', 'output_dir', 'mask_dir', 'gt_dir', 'gt_path',
         'msflow_ckpt', 'rf_ckpt', 'msflow_work_dir', 'rf_work_dir',
     ):
         setattr(args, path_attr, expand_path_string(getattr(args, path_attr)))
