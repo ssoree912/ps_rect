@@ -6,6 +6,7 @@ import sys
 import argparse
 import datetime
 import time
+from functools import lru_cache
 from typing import List, Optional
 
 import cv2
@@ -304,22 +305,59 @@ def image_name_to_gt_txt(fname: str) -> str:
     return stem + '.txt'
 
 
-def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str) -> Optional[str]:
-    """Find matching GT txt. Try gt_dir/folder_name first, then gt_dir."""
+@lru_cache(maxsize=16)
+def build_gt_name_index(gt_dir: str):
+    index = {}
+    if not os.path.isdir(gt_dir):
+        return index
+    for dirpath, _, filenames in os.walk(gt_dir):
+        for name in filenames:
+            if not name.lower().endswith('.txt'):
+                continue
+            index.setdefault(name.lower(), []).append(os.path.join(dirpath, name))
+    return index
+
+
+def choose_indexed_gt(paths, folder_name: Optional[str], label_name: Optional[str]) -> Optional[str]:
+    if not paths:
+        return None
+
+    preferred = sorted(paths)
+    if folder_name is not None:
+        folder_matches = [p for p in preferred if str(folder_name) in os.path.normpath(p).split(os.sep)]
+        if folder_matches:
+            preferred = folder_matches
+    if label_name is not None:
+        label_matches = [p for p in preferred if str(label_name) in os.path.normpath(p).split(os.sep)]
+        if label_matches:
+            preferred = label_matches
+
+    return preferred[0] if len(preferred) == 1 else None
+
+
+def find_gt_path(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None) -> Optional[str]:
+    """Find matching GT txt for an original image filename."""
     gt_name = image_name_to_gt_txt(fname)
 
     candidates = []
+    if label_name is not None and folder_name is not None:
+        candidates.append(os.path.join(gt_dir, str(label_name), str(folder_name), gt_name))
     if folder_name is not None:
         candidates.append(os.path.join(gt_dir, str(folder_name), gt_name))
+    if label_name is not None:
+        candidates.append(os.path.join(gt_dir, str(label_name), gt_name))
     candidates.append(os.path.join(gt_dir, gt_name))
 
     for path in candidates:
         if os.path.isfile(path):
             return path
-    return None
 
+    # Fallback for GT directories that have an extra nesting level. Only use it
+    # when the basename resolves unambiguously after folder/label preference.
+    index = build_gt_name_index(os.path.abspath(gt_dir))
+    return choose_indexed_gt(index.get(gt_name.lower(), []), folder_name, label_name)
 
-def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str):
+def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None):
     """
     Load GT boxes for an image.
 
@@ -330,7 +368,7 @@ def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str):
       gt_boxes: list[(x1, y1, x2, y2)]
       gt_path: matched txt path or None
     """
-    gt_path = find_gt_path(gt_dir, folder_name, fname)
+    gt_path = find_gt_path(gt_dir, folder_name, fname, label_name)
     if gt_path is None:
         return [], None
 
@@ -777,7 +815,7 @@ def run_one_folder(args, folder_name: str):
             )
 
             if args.eval_f1:
-                gt_boxes, gt_path = load_gt_boxes(args.gt_dir, folder_name, fname)
+                gt_boxes, gt_path = load_gt_boxes(args.gt_dir, folder_name, fname, label_names[b])
                 if gt_path is None:
                     missing_gt_images += 1
                     if args.count_missing_gt_as_empty:
@@ -892,7 +930,8 @@ def run_single_model(args):
 
             if args.eval_f1:
                 eval_folder_name = folder_names[b]
-                gt_boxes, gt_path = load_gt_boxes(args.gt_dir, eval_folder_name, fnames[b])
+                gt_fname = os.path.basename(img_paths[b])
+                gt_boxes, gt_path = load_gt_boxes(args.gt_dir, eval_folder_name, gt_fname, label_names[b])
                 if gt_path is None:
                     missing_gt_images += 1
 
