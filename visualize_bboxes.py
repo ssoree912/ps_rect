@@ -37,6 +37,12 @@ def option_was_provided(argv: List[str], *names: str) -> bool:
     return False
 
 
+def expand_path_string(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.expandvars(os.path.expanduser(path))
+
+
 def apply_keep_mask_to_anomaly_map(
     anomaly_map,
     mask_dir,
@@ -1014,9 +1020,9 @@ def run_single_model(args):
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize POSCO bounding boxes from MSFlow+RF localization map')
-    parser.add_argument('--data_root', type=str, default='./data/posco/test',
+    parser.add_argument('--data_root', '--data-root', dest='data_root', type=str, default='./data/posco/test',
                         help='POSCO test root containing normal/*.jpg and abnormal/*.jpg')
-    parser.add_argument('--output_dir', type=str, default='./results2',
+    parser.add_argument('--output_dir', '--output-dir', dest='output_dir', type=str, default='./results2',
                         help='Where to save images with bounding boxes')
     parser.add_argument('--save_heatmap', action='store_true', default=True,
                         help='Save pure heatmap image next to bbox image in the same folder. Default: True')
@@ -1024,7 +1030,7 @@ def main():
                         help='Disable heatmap saving')
     parser.add_argument('--apply-test-mask', action='store_true', default=True,
                         help='Use folder-specific mask only after inference: bbox/anomaly scores outside ROI are suppressed. Model input remains the original image.')
-    parser.add_argument('--mask-dir', type=str, default='./mask',
+    parser.add_argument('--mask-dir', '--mask_dir', dest='mask_dir', type=str, default='./mask',
                         help='Directory containing 02_mask.jpg, 04_mask.jpg, ...')
     parser.add_argument('--mask-threshold', type=int, default=10,
                         help='Pixels <= threshold in mask are treated as black masked-out area.')
@@ -1032,7 +1038,7 @@ def main():
                         help='Shrink white ROI before bbox generation. Use 0 to keep ROI unchanged.')
     parser.add_argument('--mask-close-kernel', type=int, default=7,
                         help='Fill small black holes inside white ROI. Use 0 to disable.')
-    parser.add_argument('--gt-dir', type=str, default='./gt',
+    parser.add_argument('--gt-dir', '--gt_dir', dest='gt_dir', type=str, default='./gt',
                         help='Directory containing GT txt files. Supports either gt/<name>.txt or gt/<folder>/<name>.txt.')
     parser.add_argument('--eval-f1', action='store_true', default=False,
                         help='Compute micro precision/recall/F1 using GT txt files and predicted boxes.')
@@ -1052,10 +1058,10 @@ def main():
                         help='Run each POSCO subfolder with its matching MSFlow and RF checkpoints.')
     parser.add_argument('--folder-names', type=str, nargs='+', default=None,
                         help='Optional folder names to run, e.g., --folder-names 01 02 05. If omitted, auto-discover.')
-    parser.add_argument('--msflow-work-dir', type=str, default='work_dirs')
+    parser.add_argument('--msflow-work-dir', '--msflow_work_dir', dest='msflow_work_dir', type=str, default='work_dirs')
     parser.add_argument('--msflow-version', type=str, default='msflow_wide_resnet50_2_avgpool_pl258')
     parser.add_argument('--msflow-ckpt-name', type=str, default='last.pt')
-    parser.add_argument('--rf-work-dir', type=str, default='work_dirs')
+    parser.add_argument('--rf-work-dir', '--rf_work_dir', dest='rf_work_dir', type=str, default='work_dirs')
     parser.add_argument('--rf-version', type=str, default='rf_on_msflow_wide_resnet50_2_avgpool_pl258')
     parser.add_argument('--rf-ckpt-name', type=str, default='rf_last.pt')
 
@@ -1077,6 +1083,11 @@ def main():
     args = parser.parse_args()
     args.explicit_msflow_ckpt = option_was_provided(raw_argv, '--msflow_ckpt', '--msflow-ckpt')
     args.explicit_rf_ckpt = option_was_provided(raw_argv, '--rf_ckpt', '--rf-ckpt')
+    for path_attr in (
+        'data_root', 'output_dir', 'mask_dir', 'gt_dir',
+        'msflow_ckpt', 'rf_ckpt', 'msflow_work_dir', 'rf_work_dir',
+    ):
+        setattr(args, path_attr, expand_path_string(getattr(args, path_attr)))
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 

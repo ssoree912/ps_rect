@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 from collections import defaultdict
@@ -20,6 +21,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 Box = Tuple[int, int, int, int]
+
+
+def expand_path(path: Path) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(path))))
+
+
+def expand_optional_path(path: Optional[Path]) -> Optional[Path]:
+    return None if path is None else expand_path(path)
 
 
 def normalize_key(name: str) -> str:
@@ -259,8 +268,12 @@ def write_text_list(path: Path, lines: Sequence[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Overlay POSCO GT boxes on matching test images.')
+    parser.add_argument('--image-path', '--image_path', dest='image_path', type=Path, default=None,
+                        help='Direct mode: exact test image path to overlay.')
+    parser.add_argument('--gt-path', '--gt_path', dest='gt_path', type=Path, default=None,
+                        help='Direct mode: exact GT txt path for --image-path.')
     parser.add_argument('--data-root', '--data_root', dest='data_root', type=Path, default=Path('./data/posco/test'))
-    parser.add_argument('--gt-dir', dest='gt_dir', type=Path, default=Path('./gt'))
+    parser.add_argument('--gt-dir', '--gt_dir', dest='gt_dir', type=Path, default=Path('./gt'))
     parser.add_argument('--output-dir', '--output_dir', dest='output_dir', type=Path, default=Path('./gt_overlay'))
     parser.add_argument('--labels', nargs='*', default=['abnormal'],
                         help='Top-level test labels to scan. Use --labels all to scan every image under data-root.')
@@ -272,9 +285,55 @@ def main() -> None:
                         help='Save overlay images even when the matched GT file has no valid boxes.')
     args = parser.parse_args()
 
-    data_root = args.data_root.resolve()
-    gt_dir = args.gt_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    image_path = expand_optional_path(args.image_path)
+    gt_path_arg = expand_optional_path(args.gt_path)
+    data_root = expand_path(args.data_root)
+    gt_dir = expand_path(args.gt_dir)
+    output_dir = expand_path(args.output_dir)
+
+    if image_path is not None or gt_path_arg is not None:
+        if image_path is None or gt_path_arg is None:
+            raise ValueError('Use --image-path and --gt-path together for direct overlay mode.')
+        if not image_path.is_file():
+            raise FileNotFoundError(f'image-path not found: {image_path}')
+        if not gt_path_arg.is_file():
+            raise FileNotFoundError(f'gt-path not found: {gt_path_arg}')
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with Image.open(image_path) as img:
+            boxes = load_boxes(gt_path_arg, img.size, args.box_format, args.normalized)
+            overlay = draw_gt_overlay(img, boxes, gt_path_arg.name)
+            out_path = output_dir / f'{image_path.stem}_gt_overlay.jpg'
+            overlay.save(out_path, quality=95)
+
+        rows = [{
+            'image_path': str(image_path),
+            'gt_path': str(gt_path_arg),
+            'output_path': str(out_path),
+            'label': '',
+            'folder': '',
+            'box_count': len(boxes),
+            'match_status': 'direct_path',
+        }]
+        with (output_dir / 'matched.csv').open('w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=['image_path', 'gt_path', 'output_path', 'label', 'folder', 'box_count', 'match_status'],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        summary = [
+            f'image_path: {image_path}',
+            f'gt_path: {gt_path_arg}',
+            f'output_path: {out_path}',
+            f'box_count: {len(boxes)}',
+            'box_format: xyxy_pixels' if args.box_format == 'xyxy' and not args.normalized else f'box_format: {args.box_format}',
+        ]
+        write_text_list(output_dir / 'summary.txt', summary)
+        print('\n'.join(summary))
+        print(f'overlay: {out_path}')
+        return
 
     if not data_root.is_dir():
         raise FileNotFoundError(f'data-root not found: {data_root}')
