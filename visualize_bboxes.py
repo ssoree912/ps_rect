@@ -587,8 +587,11 @@ def save_heatmap_outputs(anomaly_map: np.ndarray,
                          save_size=(1920, 1080),
                          mask_dir: Optional[str] = None,
                          folder_name: Optional[str] = None,
-                         mask_threshold: int = 10):
-    """Save pure heatmap.
+                         mask_threshold: int = 10,
+                         bboxes=None,
+                         bbox_color='red',
+                         bbox_width=6):
+    """Save heatmap, optionally with predicted bounding boxes drawn on top.
 
     If mask_dir/folder_name are given, the black mask area is forced to black
     AFTER resizing/colorizing the heatmap. This prevents interpolation from
@@ -614,6 +617,13 @@ def save_heatmap_outputs(anomaly_map: np.ndarray,
     heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
 
     heatmap_pil = Image.fromarray(heatmap_rgb)
+    if bboxes is not None and len(bboxes) > 0:
+        heatmap_pil = draw_bboxes_on_image(
+            heatmap_pil,
+            bboxes,
+            color=bbox_color,
+            width=bbox_width,
+        )
 
     stem, ext = os.path.splitext(fname)
     ext = ext if ext else '.jpg'
@@ -685,6 +695,9 @@ def save_outputs(img_tensor: torch.Tensor,
             mask_dir=mask_dir,
             folder_name=folder_name,
             mask_threshold=mask_threshold,
+            bboxes=scaled_bboxes,
+            bbox_color='red',
+            bbox_width=6,
         )
 
     return scaled_bboxes
