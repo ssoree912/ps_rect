@@ -402,6 +402,18 @@ def write_missing_gt_log(path: str, records):
             f.write(record + '\n')
 
 
+def write_normal_box_log(path: str, normal_images: int, normal_images_with_boxes: int,
+                         normal_total_boxes: int, records):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(f'normal_images: {normal_images}\n')
+        f.write(f'normal_images_with_boxes: {normal_images_with_boxes}\n')
+        f.write(f'normal_total_boxes: {normal_total_boxes}\n')
+        f.write('\n[per_image] image_path\tboxes\toutput_dir\n')
+        for record in records:
+            f.write(record + '\n')
+
+
 def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None):
     """
     Load GT boxes for an image.
@@ -827,6 +839,10 @@ def run_one_folder(args, folder_name: str):
     empty_gt_files = 0
     total_pred_boxes = 0
     total_gt_boxes = 0
+    normal_images = 0
+    normal_images_with_boxes = 0
+    normal_total_boxes = 0
+    normal_box_records = []
 
     for imgs, img_paths, label_names, folder_names, fnames in loader:
         imgs = imgs.to(cfg.device, non_blocking=True)
@@ -870,6 +886,16 @@ def run_one_folder(args, folder_name: str):
                 mask_threshold=args.mask_threshold,
             )
 
+            if label_names[b] == 'normal':
+                normal_box_count = len(pred_boxes)
+                normal_images += 1
+                normal_total_boxes += normal_box_count
+                if normal_box_count > 0:
+                    normal_images_with_boxes += 1
+                normal_box_records.append(
+                    f'{img_paths[b]}\t{normal_box_count}\t{out_dir}'
+                )
+
             if args.eval_f1:
                 total_pred_boxes += len(pred_boxes)
                 gt_source = args.gt_path if args.gt_path is not None else args.gt_dir
@@ -900,6 +926,15 @@ def run_one_folder(args, folder_name: str):
                     evaluated_images += 1
                     save_detection_eval_txt(out_dir, fname, gt_path, pred_boxes, gt_boxes, tp, fp, fn, matches)
 
+
+    normal_log_path = os.path.join(args.output_dir, folder_name, 'normal_box_log.txt')
+    write_normal_box_log(
+        normal_log_path, normal_images, normal_images_with_boxes,
+        normal_total_boxes, normal_box_records
+    )
+    print(f'[NormalBox] folder={folder_name} normal_images={normal_images} '
+          f'normal_images_with_boxes={normal_images_with_boxes} '
+          f'normal_total_boxes={normal_total_boxes} log={normal_log_path}')
 
     if args.eval_f1:
         summary_path = os.path.join(args.output_dir, folder_name, 'f1_summary.txt')
@@ -958,6 +993,10 @@ def run_single_model(args):
     empty_gt_files = 0
     total_pred_boxes = 0
     total_gt_boxes = 0
+    normal_images = 0
+    normal_images_with_boxes = 0
+    normal_total_boxes = 0
+    normal_box_records = []
 
     for imgs, img_paths, label_names, folder_names, fnames in loader:
         imgs = imgs.to(cfg.device, non_blocking=True)
@@ -998,6 +1037,16 @@ def run_single_model(args):
                 folder_name=folder_names[b] if args.apply_test_mask else None,
                 mask_threshold=args.mask_threshold,
             )
+
+            if label_names[b] == 'normal':
+                normal_box_count = len(pred_boxes)
+                normal_images += 1
+                normal_total_boxes += normal_box_count
+                if normal_box_count > 0:
+                    normal_images_with_boxes += 1
+                normal_box_records.append(
+                    f'{img_paths[b]}\t{normal_box_count}\t{out_dir}'
+                )
 
             if args.eval_f1:
                 total_pred_boxes += len(pred_boxes)
@@ -1041,6 +1090,15 @@ def run_single_model(args):
                     save_detection_eval_txt(
                         out_dir, fnames[b], gt_path, pred_boxes, gt_boxes, tp, fp, fn, matches
                     )
+
+    normal_log_path = os.path.join(args.output_dir, 'normal_box_log.txt')
+    write_normal_box_log(
+        normal_log_path, normal_images, normal_images_with_boxes,
+        normal_total_boxes, normal_box_records
+    )
+    print(f'[NormalBox] normal_images={normal_images} '
+          f'normal_images_with_boxes={normal_images_with_boxes} '
+          f'normal_total_boxes={normal_total_boxes} log={normal_log_path}')
 
     if args.eval_f1:
         summary_path = os.path.join(args.output_dir, 'f1_summary.txt')
