@@ -414,6 +414,31 @@ def write_normal_box_log(path: str, normal_images: int, normal_images_with_boxes
             f.write(record + '\n')
 
 
+def write_bbox_count_log(path: str, counts, records_by_label):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        for label in ['normal', 'abnormal']:
+            stats = counts[label]
+            f.write(f'{label}_images: {stats["images"]}\n')
+            f.write(f'{label}_images_with_boxes: {stats["images_with_boxes"]}\n')
+            f.write(f'{label}_total_boxes: {stats["total_boxes"]}\n')
+        f.write('\n[per_image] label\timage_path\tboxes\toutput_dir\n')
+        for label in ['normal', 'abnormal']:
+            for record in records_by_label[label]:
+                f.write(record + '\n')
+
+
+def update_bbox_count(label_name: str, img_path: str, out_dir: str, pred_boxes, counts, records_by_label):
+    if label_name not in counts:
+        return
+    box_count = len(pred_boxes)
+    counts[label_name]['images'] += 1
+    counts[label_name]['total_boxes'] += box_count
+    if box_count > 0:
+        counts[label_name]['images_with_boxes'] += 1
+    records_by_label[label_name].append(f'{label_name}\t{img_path}\t{box_count}\t{out_dir}')
+
+
 def load_gt_boxes(gt_dir: str, folder_name: Optional[str], fname: str, label_name: Optional[str] = None):
     """
     Load GT boxes for an image.
@@ -839,10 +864,11 @@ def run_one_folder(args, folder_name: str):
     empty_gt_files = 0
     total_pred_boxes = 0
     total_gt_boxes = 0
-    normal_images = 0
-    normal_images_with_boxes = 0
-    normal_total_boxes = 0
-    normal_box_records = []
+    bbox_counts = {
+        'normal': {'images': 0, 'images_with_boxes': 0, 'total_boxes': 0},
+        'abnormal': {'images': 0, 'images_with_boxes': 0, 'total_boxes': 0},
+    }
+    bbox_records_by_label = {'normal': [], 'abnormal': []}
 
     for imgs, img_paths, label_names, folder_names, fnames in loader:
         imgs = imgs.to(cfg.device, non_blocking=True)
@@ -886,15 +912,10 @@ def run_one_folder(args, folder_name: str):
                 mask_threshold=args.mask_threshold,
             )
 
-            if label_names[b] == 'normal':
-                normal_box_count = len(pred_boxes)
-                normal_images += 1
-                normal_total_boxes += normal_box_count
-                if normal_box_count > 0:
-                    normal_images_with_boxes += 1
-                normal_box_records.append(
-                    f'{img_paths[b]}\t{normal_box_count}\t{out_dir}'
-                )
+            update_bbox_count(
+                label_names[b], img_paths[b], out_dir, pred_boxes,
+                bbox_counts, bbox_records_by_label
+            )
 
             if args.eval_f1:
                 total_pred_boxes += len(pred_boxes)
@@ -927,14 +948,22 @@ def run_one_folder(args, folder_name: str):
                     save_detection_eval_txt(out_dir, fname, gt_path, pred_boxes, gt_boxes, tp, fp, fn, matches)
 
 
+    bbox_log_path = os.path.join(args.output_dir, folder_name, 'bbox_count_log.txt')
     normal_log_path = os.path.join(args.output_dir, folder_name, 'normal_box_log.txt')
+    write_bbox_count_log(bbox_log_path, bbox_counts, bbox_records_by_label)
     write_normal_box_log(
-        normal_log_path, normal_images, normal_images_with_boxes,
-        normal_total_boxes, normal_box_records
+        normal_log_path, bbox_counts['normal']['images'], bbox_counts['normal']['images_with_boxes'],
+        bbox_counts['normal']['total_boxes'],
+        [r.split('\t', 1)[1] for r in bbox_records_by_label['normal']]
     )
-    print(f'[NormalBox] folder={folder_name} normal_images={normal_images} '
-          f'normal_images_with_boxes={normal_images_with_boxes} '
-          f'normal_total_boxes={normal_total_boxes} log={normal_log_path}')
+    print(f'[BBoxCount] folder={folder_name} '
+          f'normal_images={bbox_counts["normal"]["images"]} '
+          f'normal_images_with_boxes={bbox_counts["normal"]["images_with_boxes"]} '
+          f'normal_total_boxes={bbox_counts["normal"]["total_boxes"]} '
+          f'abnormal_images={bbox_counts["abnormal"]["images"]} '
+          f'abnormal_images_with_boxes={bbox_counts["abnormal"]["images_with_boxes"]} '
+          f'abnormal_total_boxes={bbox_counts["abnormal"]["total_boxes"]} '
+          f'log={bbox_log_path}')
 
     if args.eval_f1:
         summary_path = os.path.join(args.output_dir, folder_name, 'f1_summary.txt')
@@ -993,10 +1022,11 @@ def run_single_model(args):
     empty_gt_files = 0
     total_pred_boxes = 0
     total_gt_boxes = 0
-    normal_images = 0
-    normal_images_with_boxes = 0
-    normal_total_boxes = 0
-    normal_box_records = []
+    bbox_counts = {
+        'normal': {'images': 0, 'images_with_boxes': 0, 'total_boxes': 0},
+        'abnormal': {'images': 0, 'images_with_boxes': 0, 'total_boxes': 0},
+    }
+    bbox_records_by_label = {'normal': [], 'abnormal': []}
 
     for imgs, img_paths, label_names, folder_names, fnames in loader:
         imgs = imgs.to(cfg.device, non_blocking=True)
@@ -1038,15 +1068,10 @@ def run_single_model(args):
                 mask_threshold=args.mask_threshold,
             )
 
-            if label_names[b] == 'normal':
-                normal_box_count = len(pred_boxes)
-                normal_images += 1
-                normal_total_boxes += normal_box_count
-                if normal_box_count > 0:
-                    normal_images_with_boxes += 1
-                normal_box_records.append(
-                    f'{img_paths[b]}\t{normal_box_count}\t{out_dir}'
-                )
+            update_bbox_count(
+                label_names[b], img_paths[b], out_dir, pred_boxes,
+                bbox_counts, bbox_records_by_label
+            )
 
             if args.eval_f1:
                 total_pred_boxes += len(pred_boxes)
@@ -1091,14 +1116,22 @@ def run_single_model(args):
                         out_dir, fnames[b], gt_path, pred_boxes, gt_boxes, tp, fp, fn, matches
                     )
 
+    bbox_log_path = os.path.join(args.output_dir, 'bbox_count_log.txt')
     normal_log_path = os.path.join(args.output_dir, 'normal_box_log.txt')
+    write_bbox_count_log(bbox_log_path, bbox_counts, bbox_records_by_label)
     write_normal_box_log(
-        normal_log_path, normal_images, normal_images_with_boxes,
-        normal_total_boxes, normal_box_records
+        normal_log_path, bbox_counts['normal']['images'], bbox_counts['normal']['images_with_boxes'],
+        bbox_counts['normal']['total_boxes'],
+        [r.split('\t', 1)[1] for r in bbox_records_by_label['normal']]
     )
-    print(f'[NormalBox] normal_images={normal_images} '
-          f'normal_images_with_boxes={normal_images_with_boxes} '
-          f'normal_total_boxes={normal_total_boxes} log={normal_log_path}')
+    print(f'[BBoxCount] '
+          f'normal_images={bbox_counts["normal"]["images"]} '
+          f'normal_images_with_boxes={bbox_counts["normal"]["images_with_boxes"]} '
+          f'normal_total_boxes={bbox_counts["normal"]["total_boxes"]} '
+          f'abnormal_images={bbox_counts["abnormal"]["images"]} '
+          f'abnormal_images_with_boxes={bbox_counts["abnormal"]["images_with_boxes"]} '
+          f'abnormal_total_boxes={bbox_counts["abnormal"]["total_boxes"]} '
+          f'log={bbox_log_path}')
 
     if args.eval_f1:
         summary_path = os.path.join(args.output_dir, 'f1_summary.txt')
