@@ -6,23 +6,8 @@ import sys
 import argparse
 import datetime
 import time
-import sysconfig
-import importlib.util
 from functools import lru_cache
 from typing import List, Optional
-
-
-def ensure_stdlib_copy_module():
-    copy_path = os.path.join(sysconfig.get_paths()['stdlib'], 'copy.py')
-    spec = importlib.util.spec_from_file_location('copy', copy_path)
-    if spec is None or spec.loader is None:
-        return
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules['copy'] = module
-
-
-ensure_stdlib_copy_module()
 
 import cv2
 import numpy as np
@@ -289,58 +274,8 @@ def build_rf_from_batch(device, rf_ckpt_path: str, z_fused_list: List[torch.Tens
     return rf_model
 
 
-def squeeze_score_map(anomaly_map: np.ndarray) -> np.ndarray:
-    score_map = np.asarray(anomaly_map, dtype=np.float32)
-    if score_map.ndim != 2:
-        score_map = np.squeeze(score_map)
-    return score_map
-
-
-def minmax_score_map(anomaly_map: np.ndarray) -> np.ndarray:
-    score_map = squeeze_score_map(anomaly_map)
-    if score_map.size == 0:
-        return score_map
-    finite = np.isfinite(score_map)
-    if not finite.any():
-        return np.zeros_like(score_map, dtype=np.float32)
-    vmin = float(np.nanmin(score_map))
-    vmax = float(np.nanmax(score_map))
-    denom = vmax - vmin
-    if denom <= 1e-8:
-        return np.zeros_like(score_map, dtype=np.float32)
-    return ((score_map - vmin) / denom).astype(np.float32)
-
-
-def bbox_score_map(anomaly_map: np.ndarray, mode: str) -> np.ndarray:
-    if mode == 'raw':
-        return squeeze_score_map(anomaly_map)
-    if mode == 'minmax':
-        return minmax_score_map(anomaly_map)
-    raise ValueError(f'Unsupported bbox score mode: {mode}')
-
-
-def save_score_maps(out_dir: str, stem: str, raw_map: np.ndarray, selected_map: np.ndarray,
-                    mode: str, threshold: float):
-    raw_map = squeeze_score_map(raw_map)
-    selected_map = squeeze_score_map(selected_map)
-    np.save(os.path.join(out_dir, f'{stem}_score_raw.npy'), raw_map)
-    np.save(os.path.join(out_dir, f'{stem}_score_{mode}.npy'), selected_map)
-    with open(os.path.join(out_dir, f'{stem}_score_stats.txt'), 'w') as f:
-        f.write(f'bbox_score_mode: {mode}\n')
-        f.write(f'threshold: {threshold}\n')
-        maps_to_log = [('raw', raw_map)]
-        if mode != 'raw':
-            maps_to_log.append((mode, selected_map))
-        for name, score_map in maps_to_log:
-            f.write(f'{name}_min: {float(np.nanmin(score_map)):.8f}\n')
-            f.write(f'{name}_max: {float(np.nanmax(score_map)):.8f}\n')
-            f.write(f'{name}_mean: {float(np.nanmean(score_map)):.8f}\n')
-            f.write(f'{name}_std: {float(np.nanstd(score_map)):.8f}\n')
-
-
 def anomaly_map_to_bboxes(anomaly_map: np.ndarray, threshold=0.5, min_area=50):
-    score_map = squeeze_score_map(anomaly_map)
-    binary = (score_map >= threshold).astype(np.uint8)
+    binary = (anomaly_map >= threshold).astype(np.uint8)
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     bboxes = []
     for i in range(1, num_labels):
@@ -658,9 +593,7 @@ def save_outputs(img_tensor: torch.Tensor,
                  original_image_path: Optional[str] = None,
                  mask_dir: Optional[str] = None,
                  folder_name: Optional[str] = None,
-                 mask_threshold: int = 10,
-                 bbox_score_mode: str = 'raw',
-                 save_score_map: bool = False):
+                 mask_threshold: int = 10):
     """Save bbox image and heatmap image together in the same output folder.
 
     If original_image_path is given, bboxes are drawn on the original unmasked test image.
@@ -676,8 +609,7 @@ def save_outputs(img_tensor: torch.Tensor,
         img_u8 = ((img_tensor.cpu() * std + mean).clamp(0, 1) * 255).byte()
         img_pil = Image.fromarray(img_u8.permute(1, 2, 0).numpy())
 
-    score_for_bbox = bbox_score_map(anomaly_map, bbox_score_mode)
-    bboxes = anomaly_map_to_bboxes(score_for_bbox, threshold=threshold, min_area=min_area)
+    bboxes = anomaly_map_to_bboxes(anomaly_map, threshold=threshold, min_area=min_area)
 
     target_w, target_h = save_size
     resized_img = img_pil.resize((target_w, target_h), Image.BILINEAR)
@@ -697,9 +629,6 @@ def save_outputs(img_tensor: torch.Tensor,
 
     stem, ext = os.path.splitext(fname)
     ext = ext if ext else '.jpg'
-
-    if save_score_map:
-        save_score_maps(out_dir, stem, anomaly_map, score_for_bbox, bbox_score_mode, threshold)
 
     boxed = draw_bboxes_on_image(resized_img, scaled_bboxes, color='red', width=6)
     boxed.save(os.path.join(out_dir, f"{stem}_bbox{ext}"))
@@ -939,8 +868,6 @@ def run_one_folder(args, folder_name: str):
                 mask_dir=args.mask_dir if args.apply_test_mask else None,
                 folder_name=folder_name if args.apply_test_mask else None,
                 mask_threshold=args.mask_threshold,
-                bbox_score_mode=args.bbox_score_mode,
-                save_score_map=args.save_score_map,
             )
 
             if args.eval_f1:
@@ -1070,8 +997,6 @@ def run_single_model(args):
                 mask_dir=args.mask_dir if args.apply_test_mask else None,
                 folder_name=folder_names[b] if args.apply_test_mask else None,
                 mask_threshold=args.mask_threshold,
-                bbox_score_mode=args.bbox_score_mode,
-                save_score_map=args.save_score_map,
             )
 
             if args.eval_f1:
@@ -1181,11 +1106,6 @@ def main():
     parser.add_argument('--rf-ckpt-name', type=str, default='rf_last.pt')
 
     parser.add_argument('--threshold', type=float, default=2.5)
-    parser.add_argument('--bbox-score-mode', '--bbox_score_mode', dest='bbox_score_mode',
-                        choices=['raw', 'minmax'], default='raw',
-                        help='Score map used for bbox thresholding. raw keeps legacy absolute scores; minmax uses per-image 0..1 scores like the heatmap.')
-    parser.add_argument('--save-score-map', '--save_score_map', dest='save_score_map', action='store_true', default=False,
-                        help='Save raw and bbox score maps as .npy plus per-image score stats.')
     parser.add_argument('--min_area', type=int, default=80,
                         help='Minimum connected region area to keep')
     parser.add_argument('--batch_size', type=int, default=8)
@@ -1203,9 +1123,6 @@ def main():
     args = parser.parse_args()
     args.explicit_msflow_ckpt = option_was_provided(raw_argv, '--msflow_ckpt', '--msflow-ckpt')
     args.explicit_rf_ckpt = option_was_provided(raw_argv, '--rf_ckpt', '--rf-ckpt')
-    args.explicit_threshold = option_was_provided(raw_argv, '--threshold')
-    if args.bbox_score_mode == 'minmax' and not args.explicit_threshold:
-        args.threshold = 0.5
     for path_attr in (
         'data_root', 'output_dir', 'mask_dir', 'gt_dir', 'gt_path',
         'msflow_ckpt', 'rf_ckpt', 'msflow_work_dir', 'rf_work_dir',
